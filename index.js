@@ -4,7 +4,8 @@
  * Keeps action -> animation mapping on the Mac, listens to live DSH agent/tool
  * events, and sends the chosen animation + active-agent count to the mote over
  * the USB-Serial-JTAG bridge. Pending approvals/questions latch the display
- * across sessions until answered. No network, no reflash for mapping edits.
+ * across sessions until answered. A lost bridge shows hub_down; a long idle
+ * period shows sleep. No network, no reflash for mapping edits.
  */
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
@@ -43,7 +44,6 @@ const ACTIONS = [
   { id: 'question', label: 'Question', map: ['mcq'] },
   { id: 'done', label: 'Done', map: ['done'] },
   { id: 'error', label: 'Error', map: ['retry'] },
-  { id: 'offline', label: 'No Wi-Fi / unplugged', map: ['offline'] },
   { id: 'hub_down', label: 'Hub down', map: ['hub'] },
   { id: 'sleep', label: 'Sleep', map: ['sleep'] },
 ]
@@ -58,6 +58,7 @@ const VALID_ANIM = new Set(ANIMATIONS.map((a) => a.id))
 const VALID_ACTION = new Set(ACTIONS.map((a) => a.id))
 const CYCLE_MS = 8000
 const DONE_IDLE_MS = 2500
+const SLEEP_AFTER_MS = 5 * 60 * 1000
 
 function defaultMapping() {
   return Object.fromEntries(ACTIONS.map((a) => [a.id, [...a.map]]))
@@ -125,7 +126,7 @@ function actionForTool(name) {
   if (['bash', 'terminal_open', 'terminal_write', 'terminal_read',
        'terminal_close', 'job_output', 'job_kill'].includes(n)) return 'tool_exec'
   if (['subagent', 'subagent_fork', 'send_message', 'workflow'].includes(n)) return 'waiting'
-  return 'working'
+  return 'thinking'
 }
 
 function json(res, status, value) {
@@ -177,6 +178,8 @@ export function apply(ctx) {
   const agents = new Set()
   const status = { connected: false, port: null, error: null }
   const usbEnabled = process.env.CUE9_DISABLE_USB !== '1'
+  let hubDownTimer = null
+  let lastRunningAt = Date.now()
 
   const send = (line) => {
     if (bridge !== null && status.connected) {
@@ -220,11 +223,25 @@ export function apply(ctx) {
     return mapping[kind]?.[0] ?? wanted
   }
 
+  /* USB loss or a sleeping laptop is a hub_down, not an offline action.
+   * Keep urgent approvals/questions on top so the app still shows them. */
+  const setHubDown = () => {
+    if (status.connected) return
+    if (urgentKind() !== null) return
+    if (current === 'hub_down') return
+    current = 'hub_down'
+    currentAnim = mapping.hub_down?.[0] ?? null
+    currentSince = Date.now()
+    previewing = false
+    lastAgents = -1
+  }
+
   const applyUrgent = (force = false) => {
     const kind = urgentKind()
     if (kind === null) {
       if (urgentAnim === null) return
       urgentAnim = null
+      if (!status.connected) { setHubDown(); return }
       trigger(liveAction || 'idle')
       return
     }
@@ -281,6 +298,7 @@ export function apply(ctx) {
     }
     liveAction = action
     previewing = false
+    if (!status.connected) { setHubDown(); return }
     if (urgentKind() !== null) return
     const list = mapping[action] ?? []
     if (list.length === 0) {
@@ -299,6 +317,14 @@ export function apply(ctx) {
     }
   }
 
+  const restoreAfterHubDown = () => {
+    if (current !== 'hub_down') return
+    current = null
+    currentAnim = null
+    if (urgentKind() !== null) { applyUrgent(true); return }
+    trigger(liveAction || 'idle')
+  }
+
   const preview = (action) => {
     if (!VALID_ACTION.has(action)) return false
     if (doneTimer !== null) { clearTimeout(doneTimer); doneTimer = null }
@@ -307,10 +333,26 @@ export function apply(ctx) {
     return true
   }
 
+  const previewAnimation = (action, animation) => {
+    if (!VALID_ANIM.has(animation)) return false
+    if (doneTimer !== null) { clearTimeout(doneTimer); doneTimer = null }
+    previewing = true
+    current = VALID_ACTION.has(action) ? action : null
+    currentAnim = animation
+    currentSince = Date.now()
+    nextCycle = Date.now() + CYCLE_MS
+    send(`ANIM ${animation}`)
+    return true
+  }
+
   const resumeLive = () => {
     previewing = false
     if (urgentKind() !== null) {
       applyUrgent(true)
+      return true
+    }
+    if (!status.connected) {
+      setHubDown()
       return true
     }
     current = null
@@ -340,9 +382,15 @@ export function apply(ctx) {
     } catch (error) {
       status.connected = false
       status.error = String(error)
+      setHubDown()
       restartTimer = setTimeout(startBridge, 2000)
       return
     }
+    if (hubDownTimer !== null) { clearTimeout(hubDownTimer); hubDownTimer = null }
+    hubDownTimer = setTimeout(() => {
+      hubDownTimer = null
+      if (!status.connected) setHubDown()
+    }, 3000)
     const rl = createInterface({ input: bridge.stdout })
     rl.on('line', (line) => {
       let msg
@@ -352,13 +400,17 @@ export function apply(ctx) {
         status.port = msg.port ?? null
         status.error = msg.error ?? null
         if (status.connected) {
+          if (hubDownTimer !== null) { clearTimeout(hubDownTimer); hubDownTimer = null }
           while (queue.length > 0) {
             try { bridge.stdin.write(queue.shift() + '\n') } catch { break }
           }
           pushAgents()
           sendPalette()
-          if (currentAnim !== null) send(`ANIM ${currentAnim}`)
-          else trigger('idle')
+          if (current === 'hub_down') restoreAfterHubDown()
+          else if (currentAnim !== null) send(`ANIM ${currentAnim}`)
+          else if (current === null) trigger('idle')
+        } else {
+          setHubDown()
         }
       } else if (msg.type === 'line') {
         onLine(String(msg.line ?? ''))
@@ -373,10 +425,12 @@ export function apply(ctx) {
     bridge.on('error', (error) => {
       status.connected = false
       status.error = String(error)
+      setHubDown()
     })
     bridge.on('exit', () => {
       bridge = null
       status.connected = false
+      setHubDown()
       if (!bridgeStopped) restartTimer = setTimeout(startBridge, 1500)
     })
   }
@@ -411,6 +465,7 @@ export function apply(ctx) {
       bridgeStopped = true
       if (restartTimer !== null) clearTimeout(restartTimer)
       if (doneTimer !== null) clearTimeout(doneTimer)
+      if (hubDownTimer !== null) clearTimeout(hubDownTimer)
       if (bridge !== null) {
         try { bridge.kill() } catch { /* ignore */ }
       }
@@ -419,6 +474,8 @@ export function apply(ctx) {
 
   ctx.effect(() => {
     cycleTimer = setInterval(() => {
+      if (!status.connected) return
+      if (previewing) return
       if (urgentKind() !== null) return
       if (current !== null && currentAnim !== null && Date.now() >= nextCycle) {
         pick(current)
@@ -428,11 +485,13 @@ export function apply(ctx) {
   }, 'cue9-mote: animation cycles')
 
   /* Restart the scene when its own animation sequence ends. Durations follow
-   * the demo tour (work 15 s, others 6 s), not a fixed interval. No state
-   * change, no serial reconnect, no panel power cycle. */
+   * the demo tour (work 15 s, others 6 s), not a fixed interval. This also
+   * applies to urgent approvals/questions and previews: without the reset the
+   * blink phase keeps accumulating and the eyes flicker. No state change, no
+   * serial reconnect, no panel power cycle. */
   ctx.effect(() => {
     const id = setInterval(() => {
-      if (!status.connected || previewing || urgentKind() !== null || currentAnim === null) return
+      if (!status.connected || currentAnim === null) return
       const seconds = ANIMATION_SECONDS[currentAnim] ?? 6
       if (Date.now() - currentSince >= seconds * 1000) {
         send('REFRESH')
@@ -468,7 +527,7 @@ export function apply(ctx) {
   })
   ctx.on('subagent/end', (info) => {
     debug.subagentEnds++
-    trigger('working', info?.parent?.session?.id)
+    trigger('thinking', info?.parent?.session?.id)
   })
   ctx.on('session/created', () => {
     debug.sessionCreated++
@@ -477,7 +536,7 @@ export function apply(ctx) {
     debug.sessionDisposed++
     if (activeSessionId === session?.id) activeSessionId = null
   })
-  ctx.on('workflow/start', (info) => trigger('working', info?.parent?.session?.id))
+  ctx.on('workflow/start', (info) => trigger('waiting', info?.parent?.session?.id))
   ctx.on('workflow/end', (info) => trigger('done', info?.parent?.session?.id))
   ctx.on('workflow/agent-start', () => {})
   ctx.on('workflow/agent-end', () => {})
@@ -525,6 +584,7 @@ export function apply(ctx) {
         }
       })
       const runningNow = live.filter((agent) => agent?.status === 'running')
+      if (runningNow.length > 0) lastRunningAt = Date.now()
       agents.clear()
       for (const agent of runningNow) {
         if (typeof agent?.id === 'string') agents.add(agent.id)
@@ -568,10 +628,16 @@ export function apply(ctx) {
            * idle; the done timer owns the transition. */
           activeSessionId = null
           if (current !== 'done') trigger('done')
-        } else if (current !== null && current !== 'idle' && current !== 'done') {
+        } else if (current !== null && current !== 'idle' && current !== 'done'
+                   && current !== 'sleep' && current !== 'hub_down') {
           trigger('done')
         }
         if (current === 'done' && (mapping.done?.length ?? 0) === 0) trigger('idle')
+      }
+      if (status.connected && urgentKind() === null && !previewing
+          && runningNow.length === 0 && current === 'idle'
+          && Date.now() - lastRunningAt >= SLEEP_AFTER_MS) {
+        trigger('sleep')
       }
     }, 500)
     return () => clearInterval(id)
@@ -601,7 +667,8 @@ export function apply(ctx) {
           current = null
           currentAnim = null
           if (urgentKind() !== null) applyUrgent(true)
-          else if (previous !== null) trigger(previous)
+          else if (!status.connected) setHubDown()
+          else if (previous !== null && previous !== 'hub_down') trigger(previous)
           json(res, 200, payload())
         } catch (error) {
           json(res, 400, { ok: false, error: String(error) })
@@ -617,7 +684,15 @@ export function apply(ctx) {
         if (req.headers[ACTION_HEADER] !== '1') return json(res, 403, { ok: false, error: 'forbidden' })
         try {
           const body = await readJson(req)
-          if (!preview(String(body?.action ?? ''))) return json(res, 400, { ok: false, error: 'unknown-action' })
+          const action = String(body?.action ?? '')
+          const animation = String(body?.animation ?? '')
+          if (animation) {
+            if (!previewAnimation(action, animation)) {
+              return json(res, 400, { ok: false, error: 'unknown-animation' })
+            }
+          } else if (!preview(action)) {
+            return json(res, 400, { ok: false, error: 'unknown-action' })
+          }
           json(res, 200, payload())
         } catch (error) {
           json(res, 400, { ok: false, error: String(error) })
@@ -698,6 +773,8 @@ export function apply(ctx) {
             }
             status.connected = false
             status.error = null
+            if (hubDownTimer !== null) { clearTimeout(hubDownTimer); hubDownTimer = null }
+            setHubDown()
           }
           json(res, 200, payload())
         } catch (error) {
