@@ -1,0 +1,49 @@
+{
+  "name": "dsh-cue9-mote",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Headless DeepSeek Harness adapter for cue9: mirrors agent activity on a desk mote over USB.",
+  "author": "awychoi",
+  "license": "MIT",
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cue9",
+    "mote",
+    "usb",
+    "esp32",
+    "agent-activity"
+  ],
+  "scripts": {
+    "check": "node --check index.js && python3 -c \"import ast; ast.parse(open('usb_bridge.py', encoding='utf-8').read())\""
+  },
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./icon-white": "./icon-white.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "usb_bridge.py",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "icon-white.svg",
+    "docs/preview.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

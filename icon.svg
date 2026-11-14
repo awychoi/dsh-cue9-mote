@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-label="cue9 icon with accent dot">
+<rect width="1024" height="1024" rx="228" fill="#000"/>
+  <g transform="translate(132.0 132.0) scale(1.484375)"><g transform="rotate(-32 256 256)">
+    <path d="M 398.472 345.026 A 168 168 0 1 1 398.472 166.974" fill="none" stroke="#fff" stroke-width="62" stroke-linecap="round"/>
+    <ellipse cx="214" cy="236" rx="25" ry="38" fill="#fff"/>
+    <ellipse cx="306" cy="224" rx="28" ry="42" fill="#fff"/>
+  </g></g>
+  <circle cx="773.391" cy="773.391" r="34.000" fill="#FF6A00"/>
+</svg>

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "cue9 mote",
+    "description": "Mirrors DeepSeek Harness activity on a cue9 mote over USB. Pip follows the active session, extra running agents light keys, and pending approvals stay latched until answered. The cue9 app is the optional control surface."
+  }
+}

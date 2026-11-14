@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "cue9 mote",
+    "description": "通过 USB 将 DeepSeek Harness 的活动同步到 cue9 桌面小设备。Pip 跟随当前会话，多出的运行中智能体会点亮按键，待处理的审批会保持显示直到被应答。cue9 应用是可选的操控界面。"
+  }
+}
