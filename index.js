@@ -21,6 +21,7 @@ const BRIDGE = join(HERE, 'usb_bridge.py')
 const PYTHON = process.env.CUE9_PYTHON || '/usr/local/bin/python3'
 const MAPPING_PATH = join(homedir(), '.dsh', 'cue9', 'mapping.json')
 const PALETTE_PATH = join(homedir(), '.dsh', 'cue9', 'palette.json')
+const BACKGROUND_PATH = join(homedir(), '.dsh', 'cue9', 'backgrounds.json')
 const ACTION_HEADER = 'x-cue9-action'
 
 const ANIMATIONS = [
@@ -92,9 +93,9 @@ function saveMapping(mapping) {
   renameSync(tmp, MAPPING_PATH)
 }
 
-function loadPalette() {
+function loadColourMap(path) {
   try {
-    const parsed = JSON.parse(readFileSync(PALETTE_PATH, 'utf8'))
+    const parsed = JSON.parse(readFileSync(path, 'utf8'))
     if (parsed === null || typeof parsed !== 'object') return {}
     const out = {}
     for (const [name, value] of Object.entries(parsed)) {
@@ -108,13 +109,18 @@ function loadPalette() {
   }
 }
 
-function savePalette(palette) {
-  mkdirSync(dirname(PALETTE_PATH), { recursive: true })
-  const text = Object.fromEntries(Object.entries(palette).map(([name, value]) => [name, `#${value}`]))
-  const tmp = `${PALETTE_PATH}.tmp`
+function saveColourMap(path, colours) {
+  mkdirSync(dirname(path), { recursive: true })
+  const text = Object.fromEntries(Object.entries(colours).map(([name, value]) => [name, `#${value}`]))
+  const tmp = `${path}.tmp`
   writeFileSync(tmp, JSON.stringify(text, null, 2) + '\n')
-  renameSync(tmp, PALETTE_PATH)
+  renameSync(tmp, path)
 }
+
+const loadPalette = () => loadColourMap(PALETTE_PATH)
+const loadBackgrounds = () => loadColourMap(BACKGROUND_PATH)
+const savePalette = (palette) => saveColourMap(PALETTE_PATH, palette)
+const saveBackgrounds = (backgrounds) => saveColourMap(BACKGROUND_PATH, backgrounds)
 
 function actionForTool(name) {
   const n = String(name ?? '')
@@ -154,6 +160,7 @@ function readJson(req, limit = 65536) {
 export function apply(ctx) {
   let mapping = loadMapping()
   let palette = loadPalette()
+  let backgrounds = loadBackgrounds()
   let current = null
   let currentAnim = null
   let nextCycle = 0
@@ -192,6 +199,8 @@ export function apply(ctx) {
   const payload = () => ({
     ok: true,
     mapping,
+    palette: { ...palette },
+    backgrounds: { ...backgrounds },
     actions: ACTIONS,
     animations: ANIMATIONS,
     current,
@@ -366,9 +375,12 @@ export function apply(ctx) {
     if (/^PONG\b/.test(line)) status.error = null
   }
 
-  const sendPalette = () => {
+  const sendColours = () => {
     for (const [name, color] of Object.entries(palette)) {
       send(`COLOR ${name} ${color}`)
+    }
+    for (const [name, color] of Object.entries(backgrounds)) {
+      send(`BG ${name} ${color}`)
     }
   }
 
@@ -405,7 +417,7 @@ export function apply(ctx) {
             try { bridge.stdin.write(queue.shift() + '\n') } catch { break }
           }
           pushAgents()
-          sendPalette()
+          sendColours()
           if (current === 'hub_down') restoreAfterHubDown()
           else if (currentAnim !== null) send(`ANIM ${currentAnim}`)
           else if (current === null) trigger('idle')
@@ -732,18 +744,38 @@ export function apply(ctx) {
         if (req.headers[ACTION_HEADER] !== '1') return json(res, 403, { ok: false, error: 'forbidden' })
         try {
           const body = await readJson(req)
-          const incoming = body?.palette
-          if (incoming === null || typeof incoming !== 'object') {
-            return json(res, 400, { ok: false, error: 'palette-required' })
+          if (body === null || typeof body !== 'object') {
+            return json(res, 400, { ok: false, error: 'colours-required' })
           }
-          const next = {}
-          for (const [name, value] of Object.entries(incoming)) {
-            if (!VALID_ANIM.has(name) || typeof value !== 'string' || !/^#[0-9a-f]{6}$/i.test(value)) continue
-            next[name] = value.slice(1).toLowerCase()
+          const hasPalette = Object.prototype.hasOwnProperty.call(body, 'palette')
+          const hasBackgrounds = Object.prototype.hasOwnProperty.call(body, 'backgrounds')
+          if (!hasPalette && !hasBackgrounds) {
+            return json(res, 400, { ok: false, error: 'colours-required' })
           }
-          palette = next
-          savePalette(palette)
-          sendPalette()
+          const normalize = (incoming) => {
+            if (incoming === null || typeof incoming !== 'object') return null
+            const out = {}
+            for (const [name, value] of Object.entries(incoming)) {
+              if (!VALID_ANIM.has(name) || typeof value !== 'string' || !/^#[0-9a-f]{6}$/i.test(value)) continue
+              out[name] = value.slice(1).toLowerCase()
+            }
+            return out
+          }
+          let nextPalette = palette
+          let nextBackgrounds = backgrounds
+          if (hasPalette) {
+            nextPalette = normalize(body.palette)
+            if (nextPalette === null) return json(res, 400, { ok: false, error: 'palette-required' })
+          }
+          if (hasBackgrounds) {
+            nextBackgrounds = normalize(body.backgrounds)
+            if (nextBackgrounds === null) return json(res, 400, { ok: false, error: 'backgrounds-required' })
+          }
+          palette = nextPalette
+          backgrounds = nextBackgrounds
+          if (hasPalette) savePalette(palette)
+          if (hasBackgrounds) saveBackgrounds(backgrounds)
+          sendColours()
           json(res, 200, payload())
         } catch (error) {
           json(res, 400, { ok: false, error: String(error) })

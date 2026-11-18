@@ -4,7 +4,7 @@
 
 dsh-cue9-mote watches DSH activity and sends the matching animation to a desk companion over USB. When the agent needs an approval or has a question, the animation stays in your peripheral vision until you answer. You don't have to keep watching the DSH while the agent works.
 
-This plugin is part of a larger ecosystem managed via the macOS control app — live view, action-to-animation mapping, colours, preview,
+This plugin is part of a larger ecosystem managed via the macOS control app — live view, action-to-animation mapping, expression and background colours, preview,
 and firmware flashing — available at [awychoi/cue9](https://github.com/awychoi/cue9).
 
 ## Install

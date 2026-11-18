@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """cue9 USB bridge: line protocol between the DSH plugin and the mote.
 
-stdin  <- "ANIM <state>" / "AGENTS <n>" / "ALIVE" / "PING"
+stdin  <- "ANIM <state>" / "COLOR <state> <hex>" / "BG <state> <hex>"
+          / "AGENTS <n>" / "ALIVE" / "PING"
 stdout -> one JSON object per line: status, serial line, error.
 The bridge owns the serial port, retries if the board disappears, and keeps
 working when the plugin is reloaded (the parent kills it on dispose).
