@@ -228,6 +228,8 @@ export function apply(ctx) {
     error: null,
     link: link.transport,
     target: link.transport === 'wifi' ? link.host : null,
+    peer: null,
+    rssi: null,
     keepAwake: false,
   }
   const usbEnabled = process.env.CUE9_DISABLE_USB !== '1'
@@ -504,6 +506,8 @@ export function apply(ctx) {
         status.connected = msg.connected === true
         status.port = msg.port ?? null
         status.error = msg.error ?? null
+        status.peer = msg.peer ?? null
+        status.rssi = msg.rssi ?? null
         if (status.connected) {
           if (hubDownTimer !== null) { clearTimeout(hubDownTimer); hubDownTimer = null }
           while (queue.length > 0) {
