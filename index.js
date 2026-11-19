@@ -102,6 +102,7 @@ function defaultLink() {
     transport: 'usb',
     host: process.env.CUE9_SSH_HOST || 'pi@mote-pi.local',
     attach: ATTACH_PATH,
+    key: '',
     keepAwake: true,
   }
 }
@@ -114,6 +115,7 @@ function loadLink() {
       transport: parsed?.transport === 'wifi' ? 'wifi' : 'usb',
       host: typeof parsed?.host === 'string' && parsed.host.trim() ? parsed.host.trim() : base.host,
       attach: typeof parsed?.attach === 'string' && parsed.attach.trim() ? parsed.attach.trim() : base.attach,
+      key: typeof parsed?.key === 'string' ? parsed.key.trim() : '',
       keepAwake: parsed?.keepAwake !== false,
     }
   } catch {
@@ -463,15 +465,20 @@ export function apply(ctx) {
     try {
       if (link.transport === 'wifi') {
         const remote = `${process.env.CUE9_PI_PYTHON || 'python3'} ${link.attach}`
-        bridge = spawn(SSH, [
+        const sshArgs = [
           '-T',
           '-o', 'BatchMode=yes',
           '-o', 'ConnectTimeout=6',
           '-o', 'ServerAliveInterval=5',
           '-o', 'ServerAliveCountMax=3',
-          link.host,
-          remote,
-        ], { stdio: ['pipe', 'pipe', 'pipe'] })
+          '-o', 'StrictHostKeyChecking=accept-new',
+        ]
+        if (link.key) {
+          sshArgs.push('-F', '/dev/null', '-o', 'IdentityAgent=none',
+                       '-o', 'IdentitiesOnly=yes', '-i', link.key)
+        }
+        sshArgs.push(link.host, remote)
+        bridge = spawn(SSH, sshArgs, { stdio: ['pipe', 'pipe', 'pipe'] })
       } else {
         bridge = spawn(PYTHON, [BRIDGE, '--port', process.env.CUE9_PORT || 'auto'], {
           stdio: ['pipe', 'pipe', 'pipe'],
@@ -557,7 +564,7 @@ export function apply(ctx) {
     }, 250)
   }
 
-  const linkKey = () => `${link.transport}|${link.host}|${link.attach}`
+  const linkKey = () => `${link.transport}|${link.host}|${link.attach}|${link.key}`
 
   const applyLink = (next) => {
     const before = linkKey()
@@ -914,6 +921,7 @@ export function apply(ctx) {
           if (typeof body?.host === 'string' && body.host.trim()) next.host = body.host.trim()
           if (typeof body?.attach === 'string' && body.attach.trim()) next.attach = body.attach.trim()
           if (typeof body?.keepAwake === 'boolean') next.keepAwake = body.keepAwake
+          if (typeof body?.key === 'string') next.key = body.key.trim()
           applyLink(next)
           json(res, 200, payload())
         } catch (error) {
