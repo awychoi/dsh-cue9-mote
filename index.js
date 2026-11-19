@@ -9,7 +9,7 @@
  */
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -25,6 +25,7 @@ const ATTACH_PATH = process.env.CUE9_ATTACH || '~/.local/share/cue9/cue9_attach.
 const MAPPING_PATH = join(homedir(), '.dsh', 'cue9', 'mapping.json')
 const PALETTE_PATH = join(homedir(), '.dsh', 'cue9', 'palette.json')
 const BACKGROUND_PATH = join(homedir(), '.dsh', 'cue9', 'backgrounds.json')
+const PORT_PATH = join(homedir(), '.dsh', 'cue9', 'dsh.json')
 const ACTION_HEADER = 'x-cue9-action'
 
 const ANIMATIONS = [
@@ -64,6 +65,12 @@ const VALID_ANIM = new Set(ANIMATIONS.map((a) => a.id))
 const VALID_ACTION = new Set(ACTIONS.map((a) => a.id))
 const DONE_IDLE_MS = 2500
 const SLEEP_AFTER_MS = 5 * 60 * 1000
+/* Messages DSH adds on its own: instructions, the time snapshot, skill list,
+ * and background-job notices. A turn made only of these is not user work. */
+const QUIET_SOURCES = new Set([
+  'agent-instructions', 'runtime-context', 'skill-catalog', 'time-context', 'tool-jobs',
+])
+const isQuietSource = (kind) => QUIET_SOURCES.has(kind)
 
 function defaultMapping() {
   return Object.fromEntries(ACTIONS.map((a) => [a.id, [...a.map]]))
@@ -218,7 +225,12 @@ export function apply(ctx) {
   let urgentApprovals = 0
   let urgentQuestions = 0
   let urgentAnim = null
-  const debug = { subagentStarts: 0, subagentEnds: 0, sessionCreated: 0, sessionDisposed: 0 }
+  const turnState = new Map()   /* session id -> { user, toolJobs, work } */
+  const silentStops = new Set() /* sessions whose quiet turn just ended */
+  const debug = {
+    subagentStarts: 0, subagentEnds: 0, sessionCreated: 0, sessionDisposed: 0,
+    quietTurns: 0, sessionSwitches: 0, priority: 'latest',
+  }
   const queue = []
   const running = new Set()
   const agents = new Set()
@@ -351,8 +363,18 @@ export function apply(ctx) {
   const trigger = (action, sessionId) => {
     if (!VALID_ACTION.has(action)) return
     if (typeof sessionId === 'string' && sessionId.length > 0) {
-      if (activeSessionId === null) activeSessionId = sessionId
-      if (sessionId !== activeSessionId) return
+      const otherActive = activeSessionId !== null && activeSessionId !== sessionId
+      /* Work follows the latest call across sessions. A completion owns the
+       * cat only when its session already does; a background session finishing
+       * must not interrupt the one in front. */
+      if (action === 'done' && otherActive) {
+        const activeRunning = liveAgents.some((agent) =>
+          agent.sessionId === activeSessionId && agent.status === 'running')
+        if (activeRunning) return
+      }
+      if (otherActive) debug.sessionSwitches++
+      activeSessionId = sessionId
+      silentStops.delete(sessionId)
     }
     liveAction = action
     previewing = false
@@ -373,6 +395,27 @@ export function apply(ctx) {
         if (current === 'done') trigger('idle')
       }, DONE_IDLE_MS)
     }
+  }
+
+  const markWork = (sessionId) => {
+    if (typeof sessionId !== 'string' || !sessionId) return
+    const state = turnState.get(sessionId)
+    if (state) state.work = true
+    silentStops.delete(sessionId)
+  }
+
+  /* A turn made only of background-job notices must not leave a thinking face
+   * or a completion beat behind. If it was the cat, settle to idle; the poll
+   * then picks another running session if there is one. */
+  const settleQuietTurn = (sessionId) => {
+    if (typeof sessionId !== 'string' || !sessionId) return
+    silentStops.add(sessionId)
+    if (activeSessionId !== sessionId) return
+    liveAction = 'idle'
+    if (urgentKind() !== null || previewing) return
+    if (current === 'done' || current === 'idle' || current === 'sleep'
+        || current === 'hub_down') return
+    pick('idle')
   }
 
   const restoreAfterHubDown = () => {
@@ -654,6 +697,9 @@ export function apply(ctx) {
   }, 'cue9-mote: heartbeat')
 
   ctx.on('agent/created', ({ agent }) => {
+    /* A subagent is already represented by its parent session; its own
+     * creation must not take the cat away for a wake face. */
+    if (agent?.session?.header?.origin === 'subagent') return
     trigger('session_start', agent?.session?.id)
   })
   ctx.on('agent/disposed', () => {})
@@ -664,26 +710,46 @@ export function apply(ctx) {
   ctx.on('agent/error', ({ agent }) => trigger('error', agent?.session?.id))
   ctx.on('subagent/start', (info) => {
     debug.subagentStarts++
-    trigger('waiting', info?.parent?.session?.id)
+    const sid = info?.parent?.session?.id
+    markWork(sid)
+    trigger('waiting', sid)
   })
   ctx.on('subagent/end', (info) => {
     debug.subagentEnds++
-    trigger('thinking', info?.parent?.session?.id)
+    const sid = info?.parent?.session?.id
+    markWork(sid)
+    trigger('thinking', sid)
   })
   ctx.on('session/created', () => {
     debug.sessionCreated++
   })
   ctx.on('session/disposed', (session) => {
     debug.sessionDisposed++
-    if (activeSessionId === session?.id) activeSessionId = null
+    const sid = session?.id
+    if (typeof sid === 'string') {
+      turnState.delete(sid)
+      silentStops.delete(sid)
+    }
+    if (activeSessionId === sid) activeSessionId = null
   })
-  ctx.on('workflow/start', (info) => trigger('waiting', info?.parent?.session?.id))
-  ctx.on('workflow/end', (info) => trigger('done', info?.parent?.session?.id))
+  ctx.on('workflow/start', (info) => {
+    const sid = info?.parent?.session?.id
+    markWork(sid)
+    trigger('waiting', sid)
+  })
+  ctx.on('workflow/end', (info) => {
+    const sid = info?.parent?.session?.id
+    markWork(sid)
+    trigger('done', sid)
+  })
   ctx.on('workflow/agent-start', () => {})
   ctx.on('workflow/agent-end', () => {})
   ctx.on('tools/pre-execute', (exec, next) => {
+    if (exec?.agent?.session?.header?.origin === 'subagent') return next()
+    const sid = exec?.agent?.session?.id
+    markWork(sid)
     const action = actionForTool(exec?.name)
-    if (action !== null) trigger(action, exec?.agent?.session?.id)
+    if (action !== null) trigger(action, sid)
     return next()
   })
   ctx.on('approval/request', async (req, next) => {
@@ -705,9 +771,45 @@ export function apply(ctx) {
     }
   }, { prepend: true })
   ctx.on('session/event', (session, event) => {
+    /* A subagent is shown by its parent's waiting face and key; its own tool
+     * calls must not steal the cat from the parent. */
+    if (session?.header?.origin === 'subagent') return
     const type = event?.type
-    if (type === 'turn/start') trigger('thinking', session?.id)
-    else if (type === 'turn/end') trigger('done', session?.id)
+    const sid = session?.id
+    if (typeof sid !== 'string' || !sid) {
+      if (type === 'turn/end') trigger('done')
+      return
+    }
+    if (type === 'turn/start') {
+      turnState.set(sid, { user: false, toolJobs: false, work: false })
+      silentStops.delete(sid)
+      return
+    }
+    if (type === 'user/message') {
+      const kind = event?.data?.source?.kind
+      const state = turnState.get(sid)
+      if (kind === 'tool-jobs') {
+        if (state) state.toolJobs = true
+        return
+      }
+      if (!isQuietSource(kind)) {
+        if (state) state.user = true
+        trigger('thinking', sid)
+      }
+      return
+    }
+    if (type === 'turn/end') {
+      const state = turnState.get(sid)
+      turnState.delete(sid)
+      const quiet = state?.toolJobs === true
+        && state?.user !== true && state?.work !== true
+      if (quiet) {
+        debug.quietTurns++
+        settleQuietTurn(sid)
+        return
+      }
+      trigger('done', sid)
+    }
   })
 
   ctx.effect(() => {
@@ -743,6 +845,7 @@ export function apply(ctx) {
             const sid = chosen?.session?.id
             if (typeof sid === 'string' && sid.length > 0) {
               activeSessionId = sid
+              silentStops.delete(sid)
               liveAction = 'thinking'
             }
           } else if (activeSessionId !== null) {
@@ -756,19 +859,36 @@ export function apply(ctx) {
         }
         return
       }
+      /* Let the completion beat finish before another running session can take
+       * the cat. Clear the stale owner now so the post-done poll cannot fire a
+       * second done. */
+      if (current === 'done' && doneTimer !== null) {
+        if (activeAgent === undefined && activeSessionId !== null) activeSessionId = null
+        return
+      }
       if (activeAgent === undefined) {
         if (runningNow.length > 0) {
           const chosen = runningNow[runningNow.length - 1]
           const sid = chosen?.session?.id
           if (typeof sid === 'string' && sid.length > 0) {
             activeSessionId = sid
+            silentStops.delete(sid)
             trigger('thinking', sid)
           }
         } else if (activeSessionId !== null) {
-          /* A running session just stopped. Show the completion beat before
-           * idle; the done timer owns the transition. */
+          /* A running session just stopped. A quiet background turn settles to
+           * idle without a completion beat; real work gets the done beat. */
+          const stopped = activeSessionId
           activeSessionId = null
-          if (current !== 'done') trigger('done')
+          if (silentStops.delete(stopped)) {
+            liveAction = 'idle'
+            if (urgentKind() === null && !previewing && current !== 'done'
+                && current !== 'idle' && current !== 'sleep' && current !== 'hub_down') {
+              trigger('idle')
+            }
+          } else if (current !== 'done') {
+            trigger('done')
+          }
         } else if (current !== null && current !== 'idle' && current !== 'done'
                    && current !== 'sleep' && current !== 'hub_down') {
           trigger('done')
@@ -785,6 +905,30 @@ export function apply(ctx) {
   }, 'cue9-mote: all-agent poll')
 
   ctx.inject(['webServer'], (webCtx) => {
+    /* The app cannot know DSH's dynamic web port. Publish the bound origin for
+     * it to pick up when its saved address stops answering. */
+    webCtx.effect(() => {
+      let timer = null
+      const publish = () => {
+        try {
+          const port = webCtx.webServer.port
+          if (!Number.isInteger(port) || port <= 0) return
+          let origin
+          try { origin = webCtx.webServer.getOrigin() } catch {
+            origin = `http://127.0.0.1:${port}`
+          }
+          mkdirSync(dirname(PORT_PATH), { recursive: true })
+          writeFileSync(PORT_PATH, JSON.stringify({ origin, port }) + '\n')
+        } catch { /* best effort */ }
+      }
+      publish()
+      timer = setTimeout(publish, 500)
+      return () => {
+        if (timer !== null) clearTimeout(timer)
+        try { unlinkSync(PORT_PATH) } catch { /* ignore */ }
+      }
+    }, 'cue9-mote: app discovery')
+
     webCtx.effect(() => webCtx.webServer.register({
       kind: 'exact',
       path: '/plugins/cue9/state',
