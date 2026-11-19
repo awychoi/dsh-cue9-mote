@@ -19,6 +19,9 @@ export const name = 'cue9-mote'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const BRIDGE = join(HERE, 'usb_bridge.py')
 const PYTHON = process.env.CUE9_PYTHON || '/usr/local/bin/python3'
+const LINK_PATH = join(homedir(), '.dsh', 'cue9', 'link.json')
+const SSH = process.env.CUE9_SSH || '/usr/bin/ssh'
+const ATTACH_PATH = process.env.CUE9_ATTACH || '~/.local/share/cue9/cue9_attach.py'
 const MAPPING_PATH = join(homedir(), '.dsh', 'cue9', 'mapping.json')
 const PALETTE_PATH = join(homedir(), '.dsh', 'cue9', 'palette.json')
 const BACKGROUND_PATH = join(homedir(), '.dsh', 'cue9', 'backgrounds.json')
@@ -92,6 +95,37 @@ function saveMapping(mapping) {
   const tmp = `${MAPPING_PATH}.tmp`
   writeFileSync(tmp, JSON.stringify(mapping, null, 2) + '\n')
   renameSync(tmp, MAPPING_PATH)
+}
+
+function defaultLink() {
+  return {
+    transport: 'usb',
+    host: process.env.CUE9_SSH_HOST || 'pi@mote-pi.local',
+    attach: ATTACH_PATH,
+    keepAwake: true,
+  }
+}
+
+function loadLink() {
+  const base = defaultLink()
+  try {
+    const parsed = JSON.parse(readFileSync(LINK_PATH, 'utf8'))
+    return {
+      transport: parsed?.transport === 'wifi' ? 'wifi' : 'usb',
+      host: typeof parsed?.host === 'string' && parsed.host.trim() ? parsed.host.trim() : base.host,
+      attach: typeof parsed?.attach === 'string' && parsed.attach.trim() ? parsed.attach.trim() : base.attach,
+      keepAwake: parsed?.keepAwake !== false,
+    }
+  } catch {
+    return base
+  }
+}
+
+function saveLink(next) {
+  mkdirSync(dirname(LINK_PATH), { recursive: true })
+  const tmp = `${LINK_PATH}.tmp`
+  writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n')
+  renameSync(tmp, LINK_PATH)
 }
 
 function loadColourMap(path) {
@@ -168,8 +202,10 @@ export function apply(ctx) {
   let doneTimer = null
   let cycleTimer = null
   let bridge = null
+  let link = loadLink()
   let bridgeStopped = false
   let restartTimer = null
+  let caffeinate = null
   let lastAgents = -1
   let lastSerial = ''
   let previewing = false
@@ -184,7 +220,14 @@ export function apply(ctx) {
   const queue = []
   const running = new Set()
   const agents = new Set()
-  const status = { connected: false, port: null, error: null }
+  const status = {
+    connected: false,
+    port: null,
+    error: null,
+    link: link.transport,
+    target: link.transport === 'wifi' ? link.host : null,
+    keepAwake: false,
+  }
   const usbEnabled = process.env.CUE9_DISABLE_USB !== '1'
   let hubDownTimer = null
   let lastRunningAt = Date.now()
@@ -216,6 +259,7 @@ export function apply(ctx) {
     liveAgents,
     cycleSeconds: currentAnim ? (ANIMATION_SECONDS[currentAnim] ?? 6) : 6,
     status: { ...status, lastSerial },
+    link: { ...link },
     debug: { ...debug },
   })
 
@@ -385,13 +429,54 @@ export function apply(ctx) {
     }
   }
 
-  const startBridge = () => {
-    if (!usbEnabled) return
-    if (bridgeStopped) return
+  /* -w ties the child to this process: if DSH dies, the sleep assertion does
+   * too. caffeinate is the only thing that keeps the Mac reachable while the
+   * KVM is on the other laptop. */
+  const ensureCaffeinate = () => {
+    if (caffeinate !== null) return
+    if (link.keepAwake === false) return
     try {
-      bridge = spawn(PYTHON, [BRIDGE, '--port', process.env.CUE9_PORT || 'auto'], {
-        stdio: ['pipe', 'pipe', 'pipe'],
+      caffeinate = spawn('/usr/bin/caffeinate', ['-i', '-s', '-w', String(process.pid)], { stdio: 'ignore' })
+      status.keepAwake = true
+      caffeinate.on('exit', () => {
+        caffeinate = null
+        status.keepAwake = false
       })
+    } catch {
+      caffeinate = null
+      status.keepAwake = false
+    }
+  }
+
+  const stopCaffeinate = () => {
+    if (caffeinate === null) return
+    const proc = caffeinate
+    caffeinate = null
+    status.keepAwake = false
+    try { proc.removeAllListeners('exit'); proc.kill() } catch { /* ignore */ }
+  }
+
+  const startBridge = () => {
+    if (bridgeStopped) return
+    if (link.transport === 'usb' && !usbEnabled) return
+    ensureCaffeinate()
+    try {
+      if (link.transport === 'wifi') {
+        const remote = `${process.env.CUE9_PI_PYTHON || 'python3'} ${link.attach}`
+        bridge = spawn(SSH, [
+          '-T',
+          '-o', 'BatchMode=yes',
+          '-o', 'ConnectTimeout=6',
+          '-o', 'ServerAliveInterval=5',
+          '-o', 'ServerAliveCountMax=3',
+          link.host,
+          remote,
+        ], { stdio: ['pipe', 'pipe', 'pipe'] })
+      } else {
+        bridge = spawn(PYTHON, [BRIDGE, '--port', process.env.CUE9_PORT || 'auto'], {
+          stdio: ['pipe', 'pipe', 'pipe'],
+        })
+      }
     } catch (error) {
       status.connected = false
       status.error = String(error)
@@ -403,7 +488,7 @@ export function apply(ctx) {
     hubDownTimer = setTimeout(() => {
       hubDownTimer = null
       if (!status.connected) setHubDown()
-    }, 3000)
+    }, link.transport === 'wifi' ? 12000 : 3000)
     const rl = createInterface({ input: bridge.stdout })
     rl.on('line', (line) => {
       let msg
@@ -472,6 +557,37 @@ export function apply(ctx) {
     }, 250)
   }
 
+  const linkKey = () => `${link.transport}|${link.host}|${link.attach}`
+
+  const applyLink = (next) => {
+    const before = linkKey()
+    link = { ...link, ...next }
+    saveLink(link)
+    status.link = link.transport
+    status.target = link.transport === 'wifi' ? link.host : null
+    if (link.keepAwake === false) stopCaffeinate()
+    else ensureCaffeinate()
+    if (before === linkKey()) return payload()
+
+    bridgeStopped = true
+    if (restartTimer !== null) { clearTimeout(restartTimer); restartTimer = null }
+    if (bridge !== null) {
+      try { bridge.removeAllListeners('exit'); bridge.kill() } catch { /* ignore */ }
+      bridge = null
+    }
+    status.connected = false
+    status.error = null
+    if (hubDownTimer !== null) { clearTimeout(hubDownTimer); hubDownTimer = null }
+    queue.length = 0
+    setHubDown()
+    restartTimer = setTimeout(() => {
+      restartTimer = null
+      bridgeStopped = false
+      startBridge()
+    }, 250)
+    return payload()
+  }
+
   ctx.effect(() => {
     startBridge()
     return () => {
@@ -482,8 +598,9 @@ export function apply(ctx) {
       if (bridge !== null) {
         try { bridge.kill() } catch { /* ignore */ }
       }
+      stopCaffeinate()
     }
-  }, 'cue9-mote: usb bridge')
+  }, 'cue9-mote: mote bridge')
 
   ctx.effect(() => {
     cycleTimer = setInterval(() => {
@@ -783,6 +900,27 @@ export function apply(ctx) {
         }
       },
     }), 'cue9-mote: palette route')
+
+    webCtx.effect(() => webCtx.webServer.register({
+      kind: 'exact',
+      path: '/plugins/cue9/link',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
+        if (req.headers[ACTION_HEADER] !== '1') return json(res, 403, { ok: false, error: 'forbidden' })
+        try {
+          const body = await readJson(req)
+          const next = {}
+          if (body?.transport === 'wifi' || body?.transport === 'usb') next.transport = body.transport
+          if (typeof body?.host === 'string' && body.host.trim()) next.host = body.host.trim()
+          if (typeof body?.attach === 'string' && body.attach.trim()) next.attach = body.attach.trim()
+          if (typeof body?.keepAwake === 'boolean') next.keepAwake = body.keepAwake
+          applyLink(next)
+          json(res, 200, payload())
+        } catch (error) {
+          json(res, 400, { ok: false, error: String(error) })
+        }
+      },
+    }), 'cue9-mote: link route')
 
     webCtx.effect(() => webCtx.webServer.register({
       kind: 'exact',
