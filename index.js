@@ -25,7 +25,8 @@ const BACKGROUND_PATH = join(homedir(), '.dsh', 'cue9', 'backgrounds.json')
 const ACTION_HEADER = 'x-cue9-action'
 
 const ANIMATIONS = [
-  ['work', 'Frantic typing'], ['idle', 'Idle'], ['curious', 'Curious'],
+  ['work', 'Frantic typing'], ['workCrazy', 'Crazy typing'],
+  ['workAnnoyed', 'Annoyed typing'], ['idle', 'Idle'], ['curious', 'Curious'],
   ['thinking', 'Thinking'], ['search', 'Searching'], ['read', 'Reading'],
   ['wait', 'Waiting'], ['sleep', 'Sleep'], ['wake', 'Wake'], ['approval', 'Approval'],
   ['mcq', 'Question'], ['retry', 'Retry'], ['done', 'Done'], ['offline', 'Offline'],
@@ -38,8 +39,8 @@ const ACTIONS = [
   { id: 'thinking', label: 'Thinking', map: ['thinking'] },
   { id: 'tool_read', label: 'Reading / inspecting', map: ['read'] },
   { id: 'tool_search', label: 'Searching the web', map: ['search'] },
-  { id: 'tool_write', label: 'Writing / editing', map: ['work'] },
-  { id: 'tool_exec', label: 'Running commands', map: ['work'] },
+  { id: 'tool_write', label: 'Writing / editing', map: ['work', 'workCrazy', 'workAnnoyed'] },
+  { id: 'tool_exec', label: 'Running commands', map: ['work', 'workCrazy', 'workAnnoyed'] },
   { id: 'waiting', label: 'Waiting on a subagent', map: ['wait'] },
   { id: 'approval', label: 'Approval needed', map: ['approval'] },
   { id: 'question', label: 'Question', map: ['mcq'] },
@@ -49,15 +50,15 @@ const ACTIONS = [
   { id: 'sleep', label: 'Sleep', map: ['sleep'] },
 ]
 
-/* Demo sequence lengths: work is the long 15 s tour, the rest are 6 s. */
+/* Every typing take is 5 s and loops on itself; the rest are 6 s. */
 const ANIMATION_SECONDS = {
-  work: 15, idle: 6, curious: 6, thinking: 6, search: 6, read: 6, wait: 6,
-  sleep: 6, wake: 6, approval: 6, mcq: 6, retry: 6, done: 6, offline: 6, hub: 6,
+  work: 5, workCrazy: 5, workAnnoyed: 5, idle: 6, curious: 6, thinking: 6,
+  search: 6, read: 6, wait: 6, sleep: 6, wake: 6, approval: 6, mcq: 6,
+  retry: 6, done: 6, offline: 6, hub: 6,
 }
 
 const VALID_ANIM = new Set(ANIMATIONS.map((a) => a.id))
 const VALID_ACTION = new Set(ACTIONS.map((a) => a.id))
-const CYCLE_MS = 8000
 const DONE_IDLE_MS = 2500
 const SLEEP_AFTER_MS = 5 * 60 * 1000
 
@@ -213,7 +214,7 @@ export function apply(ctx) {
     agentsLive: liveAgents.length,
     agentsSubagents: liveAgents.filter((a) => !a.root && a.status === 'running').length,
     liveAgents,
-    cycleSeconds: CYCLE_MS / 1000,
+    cycleSeconds: currentAnim ? (ANIMATION_SECONDS[currentAnim] ?? 6) : 6,
     status: { ...status, lastSerial },
     debug: { ...debug },
   })
@@ -295,7 +296,7 @@ export function apply(ctx) {
     if (anim !== currentAnim) currentSince = Date.now()
     current = action
     currentAnim = anim
-    nextCycle = Date.now() + CYCLE_MS
+    nextCycle = Date.now() + (ANIMATION_SECONDS[anim] ?? 6) * 1000
     send(`ANIM ${anim}`)
   }
 
@@ -349,7 +350,7 @@ export function apply(ctx) {
     current = VALID_ACTION.has(action) ? action : null
     currentAnim = animation
     currentSince = Date.now()
-    nextCycle = Date.now() + CYCLE_MS
+    nextCycle = Date.now() + (ANIMATION_SECONDS[animation] ?? 6) * 1000
     send(`ANIM ${animation}`)
     return true
   }
