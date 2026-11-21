@@ -175,7 +175,7 @@ function actionForTool(name) {
   if (n === 'todo_write' || n === 'skill') return 'thinking'
   if (['bash', 'terminal_open', 'terminal_write', 'terminal_read',
        'terminal_close', 'job_output', 'job_kill'].includes(n)) return 'tool_exec'
-  if (['subagent', 'subagent_fork', 'send_message', 'workflow'].includes(n)) return 'waiting'
+  if (['subagent', 'subagent_fork', 'send_message', 'wait_agent', 'workflow'].includes(n)) return 'waiting'
   return 'thinking'
 }
 
@@ -362,7 +362,12 @@ export function apply(ctx) {
 
   const trigger = (action, sessionId) => {
     if (!VALID_ACTION.has(action)) return
-    if (typeof sessionId === 'string' && sessionId.length > 0) {
+    /* A session start is a wake beat, not work. Skip it while anything runs,
+     * and never let it claim the cat: the poll would read the fresh idle
+     * session as work that just stopped and play the done beat over it. */
+    const beat = action === 'session_start'
+    if (beat && liveAgents.some((agent) => agent.status === 'running')) return
+    if (!beat && typeof sessionId === 'string' && sessionId.length > 0) {
       const otherActive = activeSessionId !== null && activeSessionId !== sessionId
       /* Work follows the latest call across sessions. A completion owns the
        * cat only when its session already does; a background session finishing
@@ -376,7 +381,7 @@ export function apply(ctx) {
       activeSessionId = sessionId
       silentStops.delete(sessionId)
     }
-    liveAction = action
+    if (!beat) liveAction = action
     previewing = false
     if (!status.connected) { setHubDown(); return }
     if (urgentKind() !== null) return
@@ -752,6 +757,15 @@ export function apply(ctx) {
     if (action !== null) trigger(action, sid)
     return next()
   })
+  /* A wait ending is work resuming, not a completion: hold thinking until the
+   * next cue (the next tool call or turn/end). */
+  ctx.on('tools/result', (exec) => {
+    if (exec?.name !== 'wait_agent') return
+    if (exec?.agent?.session?.header?.origin === 'subagent') return
+    const sid = exec?.agent?.session?.id
+    markWork(sid)
+    trigger('thinking', sid)
+  })
   ctx.on('approval/request', async (req, next) => {
     beginUrgent('approval')
     try {
@@ -865,6 +879,22 @@ export function apply(ctx) {
       if (current === 'done' && doneTimer !== null) {
         if (activeAgent === undefined && activeSessionId !== null) activeSessionId = null
         return
+      }
+      /* A wake beat is a moment, not a completion. Work wins immediately; with
+       * nothing running it plays out, then settles to idle instead of done. */
+      if (current === 'session_start') {
+        if (runningNow.length > 0) {
+          trigger(liveAction || 'idle')
+          return
+        }
+        if (activeSessionId === null) {
+          const beatMs = currentAnim === null
+            ? 0
+            : (ANIMATION_SECONDS[currentAnim] ?? 6) * 1000
+          if (Date.now() - currentSince < beatMs) return
+          trigger('idle')
+          return
+        }
       }
       if (activeAgent === undefined) {
         if (runningNow.length > 0) {
