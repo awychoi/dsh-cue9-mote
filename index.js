@@ -25,8 +25,37 @@ const ATTACH_PATH = process.env.CUE9_ATTACH || '~/.local/share/cue9/cue9_attach.
 const MAPPING_PATH = join(homedir(), '.dsh', 'cue9', 'mapping.json')
 const PALETTE_PATH = join(homedir(), '.dsh', 'cue9', 'palette.json')
 const BACKGROUND_PATH = join(homedir(), '.dsh', 'cue9', 'backgrounds.json')
+const BEHAVIOUR_PATH = join(homedir(), '.dsh', 'cue9', 'behaviour.json')
 const PORT_PATH = join(homedir(), '.dsh', 'cue9', 'dsh.json')
 const ACTION_HEADER = 'x-cue9-action'
+const BEHAVIOUR_DEFAULT = { sensitivity: 3, dizzyMs: 6000, happyMs: 2400 }
+
+function normalizeBehaviour(input) {
+  const n = Number(input?.sensitivity)
+  const d = Number(input?.dizzyMs)
+  const h = Number(input?.happyMs)
+  const clamp = (v, lo, hi, fallback) => Number.isFinite(v)
+    ? Math.min(hi, Math.max(lo, Math.round(v)))
+    : fallback
+  return {
+    sensitivity: clamp(n, 1, 5, BEHAVIOUR_DEFAULT.sensitivity),
+    dizzyMs: clamp(d, 2000, 10000, BEHAVIOUR_DEFAULT.dizzyMs),
+    happyMs: clamp(h, 1000, 4000, BEHAVIOUR_DEFAULT.happyMs),
+  }
+}
+
+function loadBehaviour() {
+  try {
+    return normalizeBehaviour(JSON.parse(readFileSync(BEHAVIOUR_PATH, 'utf8')))
+  } catch {
+    return { ...BEHAVIOUR_DEFAULT }
+  }
+}
+
+function saveBehaviour(behaviour) {
+  mkdirSync(dirname(BEHAVIOUR_PATH), { recursive: true })
+  writeFileSync(BEHAVIOUR_PATH, JSON.stringify(behaviour, null, 2) + '\n')
+}
 
 const ANIMATIONS = [
   ['work', 'Frantic typing'], ['workCrazy', 'Crazy typing'],
@@ -34,18 +63,20 @@ const ANIMATIONS = [
   ['thinking', 'Thinking'], ['search', 'Searching'], ['read', 'Reading'],
   ['wait', 'Waiting'], ['sleep', 'Sleep'], ['wake', 'Wake'], ['approval', 'Approval'],
   ['mcq', 'Question'], ['retry', 'Retry'], ['done', 'Done'], ['offline', 'Offline'],
-  ['hub', 'Hub down'],
-].map(([id, label]) => ({ id, label }))
+  ['hub', 'Hub down'], ['toolCall', 'Tool call'], ['runCmd', 'Running commands'],
+  ['dizzy', 'Dizzy (shaken)', true], ['stroked', 'Happy (stroked)', true],
+].map(([id, label, deviceOnly]) => ({ id, label, deviceOnly: !!deviceOnly }))
 
 const ACTIONS = [
   { id: 'idle', label: 'Idle', map: ['idle'] },
   { id: 'session_start', label: 'Session starts', map: ['wake'] },
   { id: 'thinking', label: 'Thinking', map: ['thinking'] },
-  { id: 'tool_read', label: 'Reading / inspecting', map: ['read'] },
-  { id: 'tool_search', label: 'Searching the web', map: ['search'] },
-  { id: 'tool_write', label: 'Writing / editing', map: ['work', 'workCrazy', 'workAnnoyed'] },
-  { id: 'tool_exec', label: 'Running commands', map: ['work', 'workCrazy', 'workAnnoyed'] },
-  { id: 'waiting', label: 'Waiting on a subagent', map: ['wait'] },
+  { id: 'tool_read', label: 'Read', map: ['read'] },
+  { id: 'tool_search', label: 'Search', map: ['search'] },
+  { id: 'tool_write', label: 'Write', map: ['work', 'workCrazy', 'workAnnoyed'] },
+  { id: 'tool_edit', label: 'Edit', map: ['toolCall'] },
+  { id: 'tool_exec', label: 'Command', map: ['runCmd'] },
+  { id: 'waiting', label: 'Waiting', map: ['wait'] },
   { id: 'approval', label: 'Approval needed', map: ['approval'] },
   { id: 'question', label: 'Question', map: ['mcq'] },
   { id: 'done', label: 'Done', map: ['done'] },
@@ -58,11 +89,15 @@ const ACTIONS = [
 const ANIMATION_SECONDS = {
   work: 5, workCrazy: 5, workAnnoyed: 5, idle: 6, curious: 6, thinking: 6,
   search: 6, read: 6, wait: 6, sleep: 6, wake: 6, approval: 6, mcq: 6,
-  retry: 6, done: 6, offline: 6, hub: 6,
+  retry: 6, done: 6, offline: 6, hub: 6, toolCall: 6, runCmd: 6,
+  dizzy: 6, stroked: 3,
 }
 
 const VALID_ANIM = new Set(ANIMATIONS.map((a) => a.id))
+/* Sensor-triggered faces can be previewed and coloured, never mapped. */
+const MAPPABLE_ANIM = new Set(ANIMATIONS.filter((a) => !a.deviceOnly).map((a) => a.id))
 const VALID_ACTION = new Set(ACTIONS.map((a) => a.id))
+const MIN_CUE_MS = 600
 const DONE_IDLE_MS = 2500
 const SLEEP_AFTER_MS = 5 * 60 * 1000
 /* Messages DSH adds on its own: instructions, the time snapshot, skill list,
@@ -84,7 +119,7 @@ function normalizeMapping(input, base = defaultMapping()) {
     const list = hasKey && Array.isArray(input[action.id])
       ? input[action.id]
       : (base[action.id] ?? [])
-    out[action.id] = [...new Set(list.filter((id) => VALID_ANIM.has(id)))]
+    out[action.id] = [...new Set(list.filter((id) => MAPPABLE_ANIM.has(id)))]
   }
   return out
 }
@@ -171,10 +206,12 @@ function actionForTool(name) {
   if (['read', 'glob', 'grep', 'read_image'].includes(n)) return 'tool_read'
   if (['web_search', 'web_fetch'].includes(n)) return 'tool_search'
   if (['write', 'edit'].includes(n)) return 'tool_write'
+  if (n === 'skill') return 'tool_edit'
   if (n === 'ask_user_question') return null
-  if (n === 'todo_write' || n === 'skill') return 'thinking'
+  if (n === 'todo_write') return 'tool_write'
+  if (n === 'think') return 'thinking'
   if (['bash', 'terminal_open', 'terminal_write', 'terminal_read',
-       'terminal_close', 'job_output', 'job_kill'].includes(n)) return 'tool_exec'
+       'terminal_close', 'job_output', 'job_kill', 'job_list'].includes(n)) return 'tool_exec'
   if (['subagent', 'subagent_fork', 'send_message', 'wait_agent', 'workflow'].includes(n)) return 'waiting'
   return 'thinking'
 }
@@ -205,6 +242,7 @@ export function apply(ctx) {
   let mapping = loadMapping()
   let palette = loadPalette()
   let backgrounds = loadBackgrounds()
+  let behaviour = loadBehaviour()
   let current = null
   let currentAnim = null
   let nextCycle = 0
@@ -225,6 +263,8 @@ export function apply(ctx) {
   let urgentApprovals = 0
   let urgentQuestions = 0
   let urgentAnim = null
+  let pendingCue = null
+  let pendingTimer = null
   const turnState = new Map()   /* session id -> { user, toolJobs, work } */
   const silentStops = new Set() /* sessions whose quiet turn just ended */
   const debug = {
@@ -261,6 +301,7 @@ export function apply(ctx) {
     mapping,
     palette: { ...palette },
     backgrounds: { ...backgrounds },
+    behaviour: { ...behaviour },
     actions: ACTIONS,
     animations: ANIMATIONS,
     current,
@@ -392,6 +433,26 @@ export function apply(ctx) {
       return
     }
     if (current === action && currentAnim !== null) return
+    /* Fast tools would otherwise be replaced by the next Thinking cue within
+     * a frame or two. Hold every face for a readable minimum; the latest
+     * pending cue wins when the hold expires. */
+    if (current !== null && Date.now() - currentSince < MIN_CUE_MS) {
+      pendingCue = { action, sessionId }
+      if (pendingTimer === null) {
+        pendingTimer = setTimeout(() => {
+          pendingTimer = null
+          const cue = pendingCue
+          pendingCue = null
+          if (cue !== null) trigger(cue.action, cue.sessionId)
+        }, Math.max(60, MIN_CUE_MS - (Date.now() - currentSince)))
+      }
+      return
+    }
+    if (pendingTimer !== null) {
+      clearTimeout(pendingTimer)
+      pendingTimer = null
+      pendingCue = null
+    }
     pick(action)
     if (action === 'done') {
       if (doneTimer !== null) clearTimeout(doneTimer)
@@ -433,6 +494,8 @@ export function apply(ctx) {
 
   const preview = (action) => {
     if (!VALID_ACTION.has(action)) return false
+    /* An approval/question owns the screen until DSH resolves it. */
+    if (urgentKind() !== null) return false
     if (doneTimer !== null) { clearTimeout(doneTimer); doneTimer = null }
     previewing = true
     pick(action)
@@ -479,6 +542,10 @@ export function apply(ctx) {
     for (const [name, color] of Object.entries(backgrounds)) {
       send(`BG ${name} ${color}`)
     }
+  }
+
+  const sendBehaviour = () => {
+    send(`BEHAVIOUR ${behaviour.sensitivity} ${behaviour.dizzyMs} ${behaviour.happyMs}`)
   }
 
   /* -w ties the child to this process: if DSH dies, the sleep assertion does
@@ -563,6 +630,7 @@ export function apply(ctx) {
           }
           pushAgents()
           sendColours()
+          sendBehaviour()
           if (current === 'hub_down') restoreAfterHubDown()
           else if (currentAnim !== null) send(`ANIM ${currentAnim}`)
           else if (current === null) trigger('idle')
@@ -666,7 +734,10 @@ export function apply(ctx) {
       if (!status.connected) return
       if (previewing) return
       if (urgentKind() !== null) return
-      if (current !== null && currentAnim !== null && Date.now() >= nextCycle) {
+      /* Wake is a one-shot beat; the poll settles it to idle. Re-picking it
+       * here would restart the face right as it finishes. */
+      if (current !== null && current !== 'session_start'
+          && currentAnim !== null && Date.now() >= nextCycle) {
         pick(current)
       }
     }, 500)
@@ -680,7 +751,7 @@ export function apply(ctx) {
    * serial reconnect, no panel power cycle. */
   ctx.effect(() => {
     const id = setInterval(() => {
-      if (!status.connected || currentAnim === null) return
+      if (!status.connected || currentAnim === null || current === 'session_start') return
       const seconds = ANIMATION_SECONDS[currentAnim] ?? 6
       if (Date.now() - currentSince >= seconds * 1000) {
         send('REFRESH')
@@ -757,14 +828,11 @@ export function apply(ctx) {
     if (action !== null) trigger(action, sid)
     return next()
   })
-  /* A wait ending is work resuming, not a completion: hold thinking until the
-   * next cue (the next tool call or turn/end). */
+  /* A tool result does not pick a face. The next model step or the assistant
+   * message that follows decides whether it is thinking or writing. */
   ctx.on('tools/result', (exec) => {
-    if (exec?.name !== 'wait_agent') return
     if (exec?.agent?.session?.header?.origin === 'subagent') return
-    const sid = exec?.agent?.session?.id
-    markWork(sid)
-    trigger('thinking', sid)
+    markWork(exec?.agent?.session?.id)
   })
   ctx.on('approval/request', async (req, next) => {
     beginUrgent('approval')
@@ -794,6 +862,22 @@ export function apply(ctx) {
       if (type === 'turn/end') trigger('done')
       return
     }
+    if (type === 'step/start') {
+      /* A model step starts with reasoning; the assistant message that ends
+       * it decides whether the visible part was writing. */
+      markWork(sid)
+      trigger('thinking', sid)
+      return
+    }
+    if (type === 'assistant/message') {
+      const content = event?.data?.message?.content
+      if (!Array.isArray(content)) return
+      markWork(sid)
+      const wrote = content.some((block) =>
+        block?.type === 'text' && typeof block.text === 'string' && block.text.trim())
+      trigger(wrote ? 'tool_write' : 'thinking', sid)
+      return
+    }
     if (type === 'turn/start') {
       turnState.set(sid, { user: false, toolJobs: false, work: false })
       silentStops.delete(sid)
@@ -808,6 +892,7 @@ export function apply(ctx) {
       }
       if (!isQuietSource(kind)) {
         if (state) state.user = true
+        /* Start a turn by understanding the task, not already writing. */
         trigger('thinking', sid)
       }
       return
@@ -860,7 +945,7 @@ export function apply(ctx) {
             if (typeof sid === 'string' && sid.length > 0) {
               activeSessionId = sid
               silentStops.delete(sid)
-              liveAction = 'thinking'
+              liveAction = 'tool_write'
             }
           } else if (activeSessionId !== null) {
             activeSessionId = null
@@ -869,7 +954,7 @@ export function apply(ctx) {
             liveAction = 'idle'
           }
         } else if (liveAction === 'done' || liveAction === 'idle') {
-          liveAction = 'thinking'
+          liveAction = 'tool_write'
         }
         return
       }
@@ -887,14 +972,16 @@ export function apply(ctx) {
           trigger(liveAction || 'idle')
           return
         }
-        if (activeSessionId === null) {
-          const beatMs = currentAnim === null
-            ? 0
-            : (ANIMATION_SECONDS[currentAnim] ?? 6) * 1000
-          if (Date.now() - currentSince < beatMs) return
-          trigger('idle')
-          return
-        }
+        const beatMs = currentAnim === null
+          ? 0
+          : (ANIMATION_SECONDS[currentAnim] ?? 6) * 1000
+        if (Date.now() - currentSince < beatMs) return
+        /* The beat owns the cat for exactly one pass. With nothing running,
+         * drop the stale owner and go idle instead of falling into done. */
+        activeSessionId = null
+        liveAction = 'idle'
+        trigger('idle')
+        return
       }
       if (activeAgent === undefined) {
         if (runningNow.length > 0) {
@@ -1038,6 +1125,27 @@ export function apply(ctx) {
         json(res, 200, payload())
       },
     }), 'cue9-mote: reconnect route')
+
+    webCtx.effect(() => webCtx.webServer.register({
+      kind: 'exact',
+      path: '/plugins/cue9/behaviour',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
+        if (req.headers[ACTION_HEADER] !== '1') return json(res, 403, { ok: false, error: 'forbidden' })
+        try {
+          const body = await readJson(req)
+          if (body === null || typeof body !== 'object') {
+            return json(res, 400, { ok: false, error: 'behaviour-required' })
+          }
+          behaviour = normalizeBehaviour(body.behaviour ?? body)
+          saveBehaviour(behaviour)
+          sendBehaviour()
+          json(res, 200, payload())
+        } catch (error) {
+          json(res, 400, { ok: false, error: String(error) })
+        }
+      },
+    }), 'cue9-mote: behaviour route')
 
     webCtx.effect(() => webCtx.webServer.register({
       kind: 'exact',
